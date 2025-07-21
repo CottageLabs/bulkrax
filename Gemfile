@@ -19,7 +19,7 @@ gem 'factory_bot_rails'
 
 # Bulkrax supports Hyrax 2.3 through 4.x only.
 # Hyrax 5+ requires Rails 7.2 and is not yet supported.
-gem 'hyrax', '>= 2.3', '< 5.0'
+gem 'hyrax', '>= 2.3'
 
 gem 'oai'
 gem 'pg'
