@@ -17,14 +17,12 @@ gem 'bootstrap-sass', '~> 3.4.1'
 gem 'coderay'
 gem 'factory_bot_rails'
 
-# Conditional logic based on Ruby version
-if RUBY_VERSION >= '3.0.0'
-  gem 'hyrax', '>= 2.3'
-else
-  gem 'hyrax', '~> 4.0'
-end
+# Bulkrax supports Hyrax 2.3 through 4.x only.
+# Hyrax 5+ requires Rails 7.2 and is not yet supported.
+gem 'hyrax', '>= 2.3', '< 5.0'
 
 gem 'oai'
+gem 'pg'
 gem 'rsolr', '>= 1.0'
 gem 'rspec-rails'
 gem 'twitter-typeahead-rails', '0.11.1.pre.corejavascript'

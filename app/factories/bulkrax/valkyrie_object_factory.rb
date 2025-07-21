@@ -38,11 +38,53 @@ module Bulkrax
       end
     end
 
+    # Customized create method for Valkyrie so that @object gets set
+    def create
+      attrs = transform_attributes
+      @object = klass.new
+      conditionally_set_reindex_extent
+      run_callbacks :save do
+        run_callbacks :create do
+          @object = if klass == Bulkrax.collection_model_class
+                      create_collection(attrs)
+                    elsif klass == Bulkrax.file_model_class
+                      create_file_set(attrs)
+                    else
+                      create_work(attrs)
+                    end
+        end
+      end
+
+      apply_depositor_metadata
+      log_created(@object)
+    end
+
+    # Customized update method for Valkyrie so that @object gets set
+    def update
+      raise "Object doesn't exist" unless object
+      conditionally_destroy_existing_files
+
+      attrs = transform_attributes(update: true)
+      run_callbacks :save do
+        @object = if klass == Bulkrax.collection_model_class
+                    update_collection(attrs)
+                  elsif klass == Bulkrax.file_model_class
+                    update_file_set(attrs)
+                  else
+                    update_work(attrs)
+                  end
+      end
+      apply_depositor_metadata
+      log_updated(@object)
+    end
+
     # TODO: the following module needs revisiting for Valkyrie work.
     #       proposal is to create Bulkrax::ValkyrieFileFactory.
     include Bulkrax::FileFactory
 
     self.file_set_factory_inner_workings_class = Bulkrax::ValkyrieObjectFactory::FileFactoryInnerWorkings
+
+    delegate :transactions, to: :class
 
     ##
     # When you want a different set of transactions you can change the
@@ -55,24 +97,25 @@ module Bulkrax
       @transactions || Hyrax::Transactions::Container
     end
 
-    def transactions
-      self.class.transactions
-    end
-
     ##
     # @!group Class Method Interface
 
     ##
-    # @note This does not save either object.  We need to do that in another
-    #       loop.  Why?  Because we might be adding many items to the parent.
+    # When adding a child to a parent work, we save the parent.
+    # Locking appears inconsistent, so we are finding the parent and
+    # saving it with each child, but waiting until the end to reindex.
+    # To do this we are bypassing the save! method defined below
     def self.add_child_to_parent_work(parent:, child:)
+      parent = self.find(parent.id)
       return true if parent.member_ids.include?(child.id)
-
       parent.member_ids << child.id
-      parent.save
+      Hyrax.persister.save(resource: parent)
     end
 
+    ##
+    # The resource added to a collection can be either a work or another collection.
     def self.add_resource_to_collection(collection:, resource:, user:)
+      resource = self.find(resource.id)
       resource.member_of_collection_ids << collection.id
       save!(resource: resource, user: user)
     end
@@ -127,6 +170,8 @@ module Bulkrax
     end
 
     def self.publish(event:, **kwargs)
+      # It's a bit unclear what this should be if we can't rely on Hyrax.
+      raise NotImplementedError, "#{self}.#{__method__}" unless defined?(Hyrax)
       Hyrax.publisher.publish(event, **kwargs)
     end
 
@@ -139,19 +184,19 @@ module Bulkrax
     end
 
     def self.save!(resource:, user:)
-      if resource.respond_to?(:save!)
-        resource.save!
-      else
+      if defined?(Hyrax)
         result = Hyrax.persister.save(resource: resource)
         raise Valkyrie::Persistence::ObjectNotFoundError unless result
         Hyrax.index_adapter.save(resource: result)
         if result.collection?
-          publish('collection.metadata.updated', collection: result, user: user)
+          self.publish(event: 'collection.metadata.updated', collection: result, user: user)
         else
-          publish('object.metadata.updated', object: result, user: user)
+          self.publish(event: 'object.metadata.updated', object: result, user: user)
         end
-        resource
+      else
+        resource.save!
       end
+      resource
     end
 
     def self.update_index(resources:)
@@ -176,13 +221,12 @@ module Bulkrax
     # @return [Valkyrie::Resource] when a match is found, an instance of given
     #         :klass
     # rubocop:disable Metrics/ParameterLists
-    def self.search_by_property(value:, klass:, field: nil, name_field: nil, **)
+    def self.search_by_property(value:, field: nil, name_field: nil, search_field:, **)
       name_field ||= field
       raise "Expected named_field or field got nil" if name_field.blank?
       return if value.blank?
-
       # Return nil or a single object.
-      Hyrax.query_service.custom_query.find_by_model_and_property_value(model: klass, property: name_field, value: value)
+      Hyrax.query_service.custom_queries.find_by_property_value(property: name_field, value: value, search_field: search_field)
     end
     # rubocop:enable Metrics/ParameterLists
 
@@ -212,7 +256,7 @@ module Bulkrax
 
       Hyrax.persister.delete(resource: obj)
       Hyrax.index_adapter.delete(resource: obj)
-      self.class.publish(event: 'object.deleted', object: obj, user: user)
+      Hyrax.publisher.publish('object.deleted', object: obj, user: user)
     end
 
     def run!
@@ -231,7 +275,7 @@ module Bulkrax
 
       @object.depositor = @user.email
       object = Hyrax.persister.save(resource: @object)
-      self.class.publish(event: "object.metadata.updated", object: object, user: @user)
+      Hyrax.publisher.publish("object.metadata.updated", object: object, user: @user)
       object
     end
 
@@ -337,7 +381,7 @@ module Bulkrax
     end
 
     def find_by_id
-      Hyrax.query_service.find_by(id: attributes[:id]) if attributes.key? :id
+      find(id: attributes[:id]) if attributes.key? :id
     end
 
     ##
@@ -433,7 +477,6 @@ module Bulkrax
       remote_files.map do |r|
         file_path = download_file(r["url"])
         next unless file_path
-
         create_uploaded_file(file_path, r["file_name"])
       end.compact
     end
@@ -449,8 +492,7 @@ module Bulkrax
         file.rewind
         file.path
       rescue => e
-        Rails.logger.debug "Failed to download file from #{url}: #{e.message}"
-        nil
+        raise "Failed to download file from #{url}: #{e.message}"
       end
     end
 
@@ -460,8 +502,7 @@ module Bulkrax
       file.close
       uploaded_file
     rescue => e
-      Rails.logger.debug "Failed to create Hyrax::UploadedFile for #{file_name}: #{e.message}"
-      nil
+      raise "Failed to create Hyrax::UploadedFile for #{file_name}: #{e.message}"
     end
 
     # @Override Destroy existing files with Hyrax::Transactions
